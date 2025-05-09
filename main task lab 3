@@ -1,0 +1,250 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+#include <cstring>
+
+//--- Inputs from board buttons (used as sensors and code inputs) ---
+DigitalIn enterButton(BUTTON1), gasDetectorButton(D2), overTempDetectorButton(D3);
+DigitalIn aButton(D4), bButton(D5), cButton(D6), dButton(D7);
+
+//--- Outputs (LED indicators) ---
+DigitalOut alarmLed(LED1), incorrectCodeLed(LED3), systemBlockedLed(LED2);
+AnalogIn temperatureSensor(A0);
+UnbufferedSerial uartUsb(USBTX, USBRX, 115200);
+
+//--- Variables to store the system state ---
+bool gasDetectorState = false, overTempDetectorState = false;
+bool alarmState = false;
+int numberOfIncorrectCodes = 0;
+const int STATUS_UPDATE_INTERVAL_MS = 6000; // We'll report every 6 seconds
+float currentTemperature = 25.0;
+const float TEMPERATURE_HIGH_THRESHOLD = 40.0;
+const float TEMPERATURE_CRITICAL_THRESHOLD = 50.0;
+bool temperatureWarningActive = false, gasWarningActive = false;
+
+Timer statusTimer;
+
+//--- Function Prototypes ---
+void initInputs();
+void initOutputs();
+void updateDetectors();
+void readTemperature();
+void evaluateSafety();
+void showWarning();
+void updateAlarm();
+void processUnlocking();
+void sendStatusReport();
+void periodicStatus();
+void handleUartInput();
+void listAvailableCommands();
+void displayAlarmState();
+void displayGasDetectorState();
+void displayOverTempState();
+void displayTemperatureReading();
+
+//--- Main Program Loop ---
+int main() {
+    initInputs();
+    initOutputs();
+    statusTimer.start();
+
+    while (true) {
+        updateDetectors();          // Check if gas or temp buttons were toggled
+        readTemperature();         // Get the temperature reading
+        evaluateSafety();          // Look for warning conditions
+        updateAlarm();             // Turn on alarm if needed
+        processUnlocking();        // Try to deactivate alarm with code
+        periodicStatus();          // Auto-send status to PC
+        handleUartInput();         // Check for serial commands
+        ThisThread::sleep_for(100ms); // Slow it down a bit
+    }
+}
+
+//--- Configure button input modes ---
+void initInputs() {
+    gasDetectorButton.mode(PullDown);
+    overTempDetectorButton.mode(PullDown);
+    aButton.mode(PullDown);
+    bButton.mode(PullDown);
+    cButton.mode(PullDown);
+    dButton.mode(PullDown);
+}
+
+//--- Turn all LEDs and indicators off at start ---
+void initOutputs() {
+    alarmLed = incorrectCodeLed = systemBlockedLed = false;
+    gasDetectorState = overTempDetectorState = false;
+}
+
+//--- Check if gas or temperature buttons were toggled ---
+void updateDetectors() {
+    static bool prevGasBtn = false, prevTempBtn = false;
+
+    if (gasDetectorButton && !prevGasBtn) gasDetectorState = !gasDetectorState;
+    if (overTempDetectorButton && !prevTempBtn) overTempDetectorState = !overTempDetectorState;
+
+    prevGasBtn = gasDetectorButton;
+    prevTempBtn = overTempDetectorButton;
+}
+
+//--- Get a temperature reading from the analog sensor ---
+void readTemperature() {
+    float sensorValue = temperatureSensor.read();  // Value from 0 to 1
+    currentTemperature = sensorValue * 100.0;      // Convert to Celsius
+}
+
+//--- Look at current readings and raise warnings if needed ---
+void evaluateSafety() {
+    static bool lastTempWarning = false, lastGasWarning = false;
+
+    if (currentTemperature > TEMPERATURE_HIGH_THRESHOLD && currentTemperature <= TEMPERATURE_CRITICAL_THRESHOLD) {
+        temperatureWarningActive = true;
+    } else if (currentTemperature > TEMPERATURE_CRITICAL_THRESHOLD) {
+        temperatureWarningActive = true;
+    } else {
+        temperatureWarningActive = false;
+    }
+
+    gasWarningActive = gasDetectorState;
+
+    // Only send warning messages when states change
+    if (temperatureWarningActive != lastTempWarning || gasWarningActive != lastGasWarning) {
+        showWarning();
+    }
+
+    lastTempWarning = temperatureWarningActive;
+    lastGasWarning = gasWarningActive;
+}
+
+//--- Output a warning message to PC terminal ---
+void showWarning() {
+    char buffer[100];
+
+    if (temperatureWarningActive || gasWarningActive) {
+        uartUsb.write("\r\n!!! WARNING !!!\r\n", 19);
+
+        if (temperatureWarningActive) {
+            snprintf(buffer, sizeof(buffer), "Temperature exceeds safe limit: %.1f°C\r\n", currentTemperature);
+            uartUsb.write(buffer, strlen(buffer));
+
+            if (currentTemperature > TEMPERATURE_CRITICAL_THRESHOLD) {
+                uartUsb.write("CRITICAL TEMPERATURE LEVEL! IMMEDIATE ACTION REQUIRED!\r\n", 55);
+            } else {
+                uartUsb.write("High temperature detected. Please check system.\r\n", 49);
+            }
+        }
+
+        if (gasWarningActive) {
+            uartUsb.write("GAS DETECTED! Potential hazard present.\r\n", 41);
+            uartUsb.write("Please ventilate area and check for gas leaks.\r\n", 47);
+        }
+
+        uartUsb.write("!!!!!!!!!!!!!!!!!!\r\n\r\n", 22);
+    }
+}
+
+//--- Update alarm LED if sensor or temp thresholds are met ---
+void updateAlarm() {
+    if (gasDetectorState || overTempDetectorState || currentTemperature > TEMPERATURE_CRITICAL_THRESHOLD) {
+        alarmState = true;
+    }
+    alarmLed = alarmState;
+}
+
+//--- If the correct code is entered, turn off the alarm ---
+void processUnlocking() {
+    if (numberOfIncorrectCodes < 5) {
+        if (aButton && bButton && cButton && dButton && !enterButton) incorrectCodeLed = false;
+
+        if (enterButton && !incorrectCodeLed && alarmState) {
+            if (aButton && bButton && !cButton && !dButton) {
+                alarmState = false;
+                numberOfIncorrectCodes = 0;
+            } else {
+                incorrectCodeLed = true;
+                numberOfIncorrectCodes++;
+            }
+        }
+    } else {
+        systemBlockedLed = true; // Too many wrong attempts
+    }
+}
+
+//--- Send a full system report every 6 seconds ---
+void periodicStatus() {
+    if (statusTimer.elapsed_time() > 6s) {
+        sendStatusReport();
+        statusTimer.reset();
+    }
+}
+
+//--- Send full report to PC ---
+void sendStatusReport() {
+    char buffer[100];
+
+    uartUsb.write("\r\n========= SYSTEM STATUS REPORT =========\r\n", 43);
+
+    uartUsb.write(alarmState ? "* ALARM: ACTIVATED\r\n" : "* ALARM: NOT ACTIVATED\r\n", alarmState ? 20 : 24);
+    uartUsb.write(gasDetectorState ? "* GAS DETECTOR: ON (Gas detected!) [WARNING!]\r\n" : "* GAS DETECTOR: OFF (No gas detected)\r\n", gasDetectorState ? 47 : 38);
+    uartUsb.write(overTempDetectorState ? "* OVER TEMP DETECTOR: ON (Over temperature!) [WARNING!]\r\n" : "* OVER TEMP DETECTOR: OFF (Temperature normal)\r\n", overTempDetectorState ? 58 : 49);
+
+    snprintf(buffer, sizeof(buffer), "* TEMPERATURE: %.1f°C", currentTemperature);
+    uartUsb.write(buffer, strlen(buffer));
+    if (currentTemperature > TEMPERATURE_CRITICAL_THRESHOLD) uartUsb.write(" [CRITICAL!]\r\n", 14);
+    else if (currentTemperature > TEMPERATURE_HIGH_THRESHOLD) uartUsb.write(" [WARNING!]\r\n", 13);
+    else if (currentTemperature < 10.0) uartUsb.write(" (Low)\r\n", 8);
+    else uartUsb.write(" (Normal)\r\n", 11);
+
+    uartUsb.write(systemBlockedLed ? "* SYSTEM: BLOCKED (Too many incorrect codes)\r\n" : "* SYSTEM: NORMAL\r\n", systemBlockedLed ? 46 : 19);
+    uartUsb.write("=========================================\r\n\r\n", 44);
+}
+
+//--- Read serial input from PC and respond accordingly ---
+void handleUartInput() {
+    char receivedChar = '\0';
+
+    if (uartUsb.readable()) {
+        uartUsb.read(&receivedChar, 1);
+        switch (receivedChar) {
+            case '1': displayAlarmState(); break;
+            case '2': displayGasDetectorState(); break;
+            case '3': displayOverTempState(); break;
+            case '4': displayTemperatureReading(); break;
+            case '5': sendStatusReport(); break;
+            default: listAvailableCommands(); break;
+        }
+    }
+}
+
+//--- Respond to PC command: show alarm status ---
+void displayAlarmState() {
+    uartUsb.write(alarmState ? "The alarm is ACTIVATED\r\n" : "The alarm is NOT ACTIVATED\r\n", alarmState ? 24 : 28);
+}
+
+//--- Respond to PC command: gas detector status ---
+void displayGasDetectorState() {
+    uartUsb.write(gasDetectorState ? "Gas detected! Detector state: ON\r\n" : "No gas detected. Detector state: OFF\r\n", gasDetectorState ? 33 : 38);
+}
+
+//--- Respond to PC command: over-temp detector status ---
+void displayOverTempState() {
+    uartUsb.write(overTempDetectorState ? "Over temperature detected! Detector state: ON\r\n" : "Temperature normal. Detector state: OFF\r\n", overTempDetectorState ? 47 : 41);
+}
+
+//--- Respond to PC command: current temperature ---
+void displayTemperatureReading() {
+    char buffer[50];
+    snprintf(buffer, sizeof(buffer), "Current temperature: %.1f°C\r\n", currentTemperature);
+    uartUsb.write(buffer, strlen(buffer));
+}
+
+//--- List all commands if an invalid key is pressed ---
+void listAvailableCommands() {
+    uartUsb.write("Available commands:\r\n", 21);
+    uartUsb.write("Press '1' to get the alarm state\r\n", 34);
+    uartUsb.write("Press '2' to get the gas detector state\r\n", 42);
+    uartUsb.write("Press '3' to get the over temperature detector state\r\n", 53);
+    uartUsb.write("Press '4' to get the current temperature reading\r\n", 50);
+    uartUsb.write("Press '5' to get a complete system status report\r\n\r\n", 54);
+    uartUsb.write("Note: Full status report is automatically sent every 6 seconds\r\n", 60);
+    uartUsb.write("Warning: Warnings will be sent when temperature or gas levels exceed safe limits\r\n", 77);
+}
